@@ -3,6 +3,7 @@ import { createServerClient } from '@supabase/ssr';
 import { cookies } from 'next/headers';
 import { calculateCutoffMonth } from '@/lib/utils';
 import type { BulkUploadRequest, BulkUploadResponse, ParsedTransaction } from '@/types/transaction';
+import { predictCategory } from '@/lib/ai';
 
 /**
  * POST /api/transactions/bulk
@@ -136,13 +137,16 @@ export async function POST(request: NextRequest) {
                 // Calcular mes de corte (opcional, puede ser útil para logs o validaciones)
                 const cutoffMonth = calculateCutoffMonth(transaction.date, card.cutoff_day);
 
+
                 // Preparar objeto para insertar
+                // Extendemos el tipo localmente para incluir category opcional
                 transactionsToInsert.push({
                     card_id: card_id,
                     amount: transaction.amount,
                     date: transaction.date,
                     concept: transaction.concept,
                     type: transaction.type,
+                    category: null as string | null // Inicializamos como null para que TS no se queje luego al asignar string
                     // Nota: cutoff_month se calcula en la vista, no se almacena
                 });
 
@@ -220,10 +224,29 @@ export async function POST(request: NextRequest) {
             }, { status: 200 }); // 200 OK porque funcionó, solo que no había nada nuevo
         }
 
-        // 5. Insertar transacciones filtradas
+        // --- CATEGORIZACIÓN CON IA ---
+        // Filtrar transacciones que sí se van a insertar (finalTransactionsToInsert)
+        // y asignarles categoría si no la tienen.
+
+        // Usamos Promise.all para procesar en paralelo
+        // Ojo: Si finalTransactionsToInsert es muy grande, deberíamos usar p-limit o batches.
+        // Para este caso de uso personal, asumimos < 100 items por carga.
+
+        const categorizedTransactions = await Promise.all(
+            finalTransactionsToInsert.map(async (t) => {
+                // Si ya tiene categoría válida, la dejamos. Si no, o es null, predecimos.
+                if (!t.category) {
+                    const predicted = await predictCategory(t.concept);
+                    return { ...t, category: predicted };
+                }
+                return t;
+            })
+        );
+
+        // 5. Insertar transacciones categorizadas
         const { data: insertedData, error: insertError } = await supabase
             .from('transactions')
-            .insert(finalTransactionsToInsert)
+            .insert(categorizedTransactions)
             .select();
 
         if (insertError) {
